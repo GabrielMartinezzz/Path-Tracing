@@ -19,6 +19,8 @@
  *   https://kcoley.github.io/glTF/specification/2.0/#metallic-roughness-material
  * - OpenGL compute shader reference:
  *   https://registry.khronos.org/OpenGL-Refpages/gl4/html/glDispatchCompute.xhtml
+ * - Ray Tracer from scratch:
+ *   https://www.youtube.com/watch?v=wzZJzyX0UkI
  *
  * Overview: this shader is responsible for deciding the color of every pixel.
  * For each pixel it shoots one or more rays from the camera into the scene. When
