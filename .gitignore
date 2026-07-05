@@ -1,0 +1,9 @@
+/out
+bin/
+build/
+/.vs
+.DS_Store
+html
+latex
+.idea/
+CMakeSettings.json

@@ -1,0 +1,956 @@
+/**
+ * @file ComputeRayTracing.comp
+ * @brief GPU path tracing compute shader for the final ray tracing project.
+ * @details
+ * References used while building the ray tracer:
+ * - Physically Based Rendering, 4th ed. (ray tracing, materials, Monte Carlo):
+ *   https://pbr-book.org/
+ * - Ray Tracing in One Weekend (ray/sphere math, recursive light transport):
+ *   https://raytracing.github.io/books/RayTracingInOneWeekend.html
+ * - Scratchapixel lessons (Moller-Trumbore triangle test and BVH concepts):
+ *   https://www.scratchapixel.com/
+ * - LearnOpenGL normal/parallax mapping overview:
+ *   https://learnopengl.com/Advanced-Lighting/Parallax-Mapping
+ * - LearnOpenGL PBR theory, metallic/roughness workflow and texture meanings:
+ *   https://learnopengl.com/PBR/Theory
+ * - LearnOpenGL PBR lighting, including albedo/normal/metallic/roughness/AO maps:
+ *   https://learnopengl.com/PBR/Lighting
+ * - glTF 2.0 metallic-roughness material model:
+ *   https://kcoley.github.io/glTF/specification/2.0/#metallic-roughness-material
+ * - OpenGL compute shader reference:
+ *   https://registry.khronos.org/OpenGL-Refpages/gl4/html/glDispatchCompute.xhtml
+ *
+ * Overview: this shader is responsible for deciding the color of every pixel.
+ * For each pixel it shoots one or more rays from the camera into the scene. When
+ * a ray hits something, it bounces according to the material. The result is noisy
+ * at first, so the shader averages many frames over time until the image becomes
+ * cleaner.
+ *
+ * Important GPU inputs:
+ * - image binding 0: the image this shader writes into. It stores HDR color.
+ * - UBO binding 0: small GPU buffer with camera and GUI settings.
+ * - UBO binding 1: small GPU buffer with the fixed-size sphere array.
+ * - SSBO binding 3/4/6: larger GPU buffers with triangles, BVH boxes and models.
+ * - SSBO binding 5: small debug buffer for the pixel currently under the mouse.
+ */
+
+#version 460 core
+
+#define MAX_STACK_SIZE 32
+#define LOCAL_GROUP_X 8
+#define LOCAL_GROUP_Y 4
+#define LOCAL_GROUP_Z 1
+#define NUM_SPHERES 10
+#define PI 3.1415926
+#define GAMMA 0.8
+#define INF 1.0 / 0.0
+
+/**
+ * @brief One box in the BVH acceleration tree.
+ * @details A BVH node is a bounding box around many triangles or around two
+ * smaller boxes. BVH_traverse() checks these boxes first, so most triangles can
+ * be skipped instead of tested one by one.
+ */
+struct BVHNode
+{
+    vec3 minVec;
+    int startIndex;
+    vec3 maxVec;
+    int triangleCount;
+};
+
+/**
+ * @brief Material data copied from C++ to the GPU.
+ * @details When a ray hits an object, TraceRay() reads this to find
+ * what color is the surface, does it emit light, is it glossy, and
+ * should the ray reflect or pass through like glass
+ */
+struct RaytracingMaterial
+{
+    vec4 color_type;
+    vec4 emission_strength;
+    vec4 specular_smoothness;
+    vec4 surface_params;
+    vec4 absorption_strength;
+    vec4 glass_params;
+    vec4 pattern_params;
+};
+
+/**
+ * @brief Sphere object described directly by center and radius.
+ * @details These spheres do not come from model files. CheckRayCollision() tests
+ * them with a direct ray/sphere formula. Some spheres use emissive materials and
+ * therefore behave like light sources.
+ */
+struct Sphere {
+    RaytracingMaterial material;
+    vec3 position;
+    float radius;
+    ivec4 pbrTextureInfo;
+    vec4 pbrParameters;
+    vec4 pbrExtraParameters;
+};
+
+/**
+ * @brief One triangle from an imported mesh.
+ * @details Mesh models are reduced to triangles before reaching the shader.
+ * Positions are used for the actual intersection, normals control lighting, and
+ * UVs tell the shader where to sample textures on the surface.
+ */
+struct Triangle
+{
+    vec3 v1;
+    float pad1;
+    vec3 v2;
+    float pad2;
+    vec3 v3;
+    float pad3;
+
+    vec3 NA;
+    float pad4;
+    vec3 NB;
+    float pad5;
+    vec3 NC;
+    float pad6;
+
+    vec3 centroid_vec;
+    float pad7;
+
+    vec4 uvA_uvB;
+    vec4 uvC_pad;
+};
+
+/**
+ * @brief Information for one model placed in the scene.
+ * @details This tells the shader where the model's triangles/BVH start in the
+ * big shared buffers, what transform the model has, and which material or texture
+ * layer should be used when the model is hit.
+ */
+struct ModelInfo
+{
+    int nodeOffset;
+    int triangleOffset;
+    int textureLayer;
+    int usePBRTextures;
+    vec4 pbrParameters;
+    vec4 pbrExtraParameters;
+    mat4 worldToLocalMatrix;
+    mat4 localToWorldMatrix;
+    RaytracingMaterial material;
+};
+
+/**
+ * @brief A ray travelling through the scene.
+ * @details origin is where the ray starts, dir is where it goes, and invDir is
+ * just 1 / dir cached for faster box tests during BVH traversal.
+ */
+struct Ray
+{
+    vec3 origin;
+    vec3 dir;
+    vec3 invDir;
+};
+
+/**
+ * @brief Result of asking what did this ray hit first
+ * @details Intersection functions fill this with the hit position, normal,
+ * material and texture coordinates. TraceRay() then uses it to decide the next
+ * bounce and how much light/color to add.
+ */
+struct HitInfo
+{
+    bool didCollide;
+    bool isBackface;
+    float dst;
+    vec3 hitPoint;
+    vec3 normal;
+    vec2 uv;
+    vec3 tangent;
+    vec3 bitangent;
+    int textureLayer;
+    int usePBRTextures;
+    vec4 pbrParameters;
+    vec4 pbrExtraParameters;
+    RaytracingMaterial material;
+};
+
+layout (local_size_x = LOCAL_GROUP_X,
+        local_size_y = LOCAL_GROUP_Y,
+        local_size_z = LOCAL_GROUP_Z) in;
+
+// Image written by this shader. It keeps the running average from previous
+// frames, so main() reads the old value and writes the improved value back.
+layout (rgba32f, binding = 0) uniform image2D rayTracingTexture;
+// PBR texture arrays. Think of each array as a stack of images. The model or
+// sphere chooses which layer of the stack belongs to its material.
+layout (binding = 0) uniform sampler2DArray u_albedoTextures;
+layout (binding = 1) uniform sampler2DArray u_normalTextures;
+layout (binding = 2) uniform sampler2DArray u_roughnessTextures;
+layout (binding = 3) uniform sampler2DArray u_metallicTextures;
+layout (binding = 4) uniform sampler2DArray u_aoTextures;
+layout (binding = 5) uniform sampler2DArray u_heightTextures;
+
+bool IsValidPBRLayer(int textureLayer)
+{
+    return textureLayer >= 0 && textureLayer < textureSize(u_albedoTextures, 0).z;
+}
+
+// Small settings uploaded every frame: camera, sampling count, sky colors and
+// debug toggles. Most are edited in application.cpp or ImGui panels.
+layout (std140, binding = 0) uniform uniformParameters {
+    uint u_numAccumulatedFrames;
+    uint RAYS_PER_PIXEL_COUNT;
+    uint RAY_BOUNCE_COUNT;
+    float u_FocalLength;
+
+    vec3 u_skyboxGroundColor;
+    vec3 u_skyboxHorizonColor;
+    vec3 u_skyboxZenithColor;
+    vec3 u_CameraPos;
+
+    vec3 u_pixelGlobalInvocationID;
+    mat4 u_ModelMatrix;
+
+    bool u_WasInput;
+    bool u_displayBVH;
+    bool u_displayTriangleHeatmap;
+    bool u_displayMultipleBVHlayers;
+    uint u_BVHlayerToDisplay;
+    uint u_BVHTreeDepth;
+    bool u_show_skybox;
+    uint u_bvh_heatmap_color_limit;
+    uint u_triangle_heatmap_color_limit;
+};
+
+// Fixed-size list of simple spheres from ActiveScene::spheres.
+layout (std140, binding = 1) uniform sceneBuffer
+{
+    Sphere u_Spheres[NUM_SPHERES];
+};
+
+// Big triangle list built on the CPU. BVH leaf nodes point to ranges inside this
+// list, so the shader knows which triangles to test after it reaches a leaf.
+layout (std140, binding = 3) buffer MESH_buffer
+{
+    Triangle MESH[];
+};
+
+// Big list of BVH boxes. Each model stores the index of its first/root box.
+layout (std140, binding = 4) buffer BVH_buffer
+{
+    BVHNode BVH[];
+};
+
+// One record per model object in the scene. This connects a visible model to its
+// transform, material, texture layer and part of the triangle/BVH buffers.
+layout (std140, binding = 6) buffer MODEL_buffer
+{
+    ModelInfo MODELS[];
+};
+
+struct PixelData {
+    vec4 pixelColor;
+    uint AABB_intersect_count;
+};
+
+layout (std430, binding = 5) buffer OutputBuffer
+{
+    PixelData pixelData;
+};
+
+uint getCurrentState(ivec2 texelCoords, int screenWidth)
+{
+    // Give each pixel and frame a different random seed. Without this, every
+    // pixel would make the same random choices and the noise pattern would look
+    // repeated instead of gradually averaging out.
+    uint pixelIndex = (uint(texelCoords.y) * uint(screenWidth)) + uint(texelCoords.x);
+    return pixelIndex + u_numAccumulatedFrames * 745621u;
+}
+
+float RandomValue(inout uint state)
+{
+    // Small deterministic random-number generator. It is not "true" randomness:
+    // the state is changed in a predictable way, which is exactly what we want on
+    // the GPU because the same seed reproduces the same sequence.
+    state = state * 747796405u + 2891336453u;
+    uint result = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    result = (result >> 22u) ^ result;
+    return float(result) / 4294967295.0;
+}
+
+float RandomValueNormalDistribution(inout uint state)
+{
+    // Converts two uniform random numbers into a bell-curve distributed value.
+    // RandomDirection() uses this to get directions spread naturally around a
+    // sphere instead of biased toward cube corners.
+    float theta = 2.0 * PI * RandomValue(state);
+    float rho = sqrt(-2.0 * log(RandomValue(state)));
+    return rho * cos(theta);
+}
+
+vec3 RandomDirection(inout uint state)
+{
+    float x = RandomValueNormalDistribution(state);
+    float y = RandomValueNormalDistribution(state);
+    float z = RandomValueNormalDistribution(state);
+    return normalize(vec3(x, y, z));
+}
+
+vec3 GainSkyboxLight(const Ray ray)
+{
+    if (!u_show_skybox) {
+        return vec3(0.0);
+    }
+
+    // If a ray misses all objects, use its vertical direction to choose a color:
+    // downward rays see ground color, horizon rays see horizon color, and upward
+    // rays blend toward zenith color.
+    float skyGradientT = pow(smoothstep(0.0, 0.4, ray.dir.y), 0.35);
+    float groundToSkyT = smoothstep(-0.01, 0.0, ray.dir.y);
+    vec3 skyGradient = mix(u_skyboxHorizonColor.rgb, u_skyboxZenithColor.rgb, skyGradientT);
+    return mix(u_skyboxGroundColor.rgb, skyGradient, groundToSkyT);
+}
+
+vec3 complexityToRGB(uint complexity, uint heatmapColorLimit)
+{
+    // Debug heatmap helper. Low intersection counts become cooler colors and
+    // high counts move toward warmer colors, making expensive pixels visible.
+    float wavelength = 380.0 + 370.0 * complexity / max(float(heatmapColorLimit), 1.0);
+    vec3 color;
+
+    if (wavelength <= 380.0) color = vec3(0.0);
+    else if (wavelength <= 440.0) color = vec3(-(wavelength - 440.0) / (440.0 - 380.0) / 3.0, 0.0, 0.8);
+    else if (wavelength <= 490.0) color = vec3(0.0, (wavelength - 440.0) / (490.0 - 440.0), 1.0);
+    else if (wavelength <= 510.0) color = vec3(0.0, 1.0, -(wavelength - 510.0) / (510.0 - 490.0));
+    else if (wavelength <= 580.0) color = vec3((wavelength - 510.0) / (580.0 - 510.0), 1.0, 0.0);
+    else if (wavelength <= 645.0) color = vec3(1.0, -(wavelength - 645.0) / (645.0 - 580.0), 0.0);
+    else if (wavelength <= 780.0) color = vec3(1.0, 0.0, 0.0);
+    else color = vec3(1.0);
+
+    float factor = 1.0;
+    if (wavelength >= 380.0 && wavelength < 420.0) factor = 0.3 + 0.7 * (wavelength - 380.0) / (420.0 - 380.0);
+    else if (wavelength > 700.0 && wavelength <= 780.0) factor = 0.3 + 0.7 * (780.0 - wavelength) / (780.0 - 700.0);
+
+    return pow(factor * color, vec3(GAMMA));
+}
+
+/**
+ * @brief Tests whether a ray enters a BVH bounding box.
+ * @param ray Ray in the same space as the box.
+ * @param minVec Minimum box corner.
+ * @param maxVec Maximum box corner.
+ * @param dst Output distance to the first valid box hit.
+ * @return True when the ray intersects the box.
+ */
+bool RayAABBIntersection(Ray ray, const vec3 minVec, const vec3 maxVec, out float dst)
+{
+    // A box is treated as three pairs of parallel planes: left/right, bottom/top,
+    // back/front. For each axis we find where the ray enters and exits that pair.
+    // If the three enter/exit ranges overlap, the ray passes through the box.
+    //
+    // Formula per axis:
+    // t0 = (boxMin - ray.origin) / ray.dir
+    // t1 = (boxMax - ray.origin) / ray.dir
+    // tNear = max(min(t0.x,t1.x), min(t0.y,t1.y), min(t0.z,t1.z))
+    // tFar  = min(max(t0.x,t1.x), max(t0.y,t1.y), max(t0.z,t1.z))
+    // hit when tFar >= tNear and the box is not fully behind the ray.
+    vec3 tMin = (minVec - ray.origin) * ray.invDir;
+    vec3 tMax = (maxVec - ray.origin) * ray.invDir;
+    vec3 t1 = min(tMin, tMax);
+    vec3 t2 = max(tMin, tMax);
+
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+    bool hit = tFar >= tNear && tFar > 0.0;
+    dst = hit ? (tNear > 0.0 ? tNear : tFar) : INF;
+    return hit;
+}
+
+/**
+ * @brief Finds where a ray hits a sphere, if it hits at all.
+ * @details The sphere has a simple formula, so no BVH or triangle test is needed.
+ */
+HitInfo RaySphereIntersection(Ray ray, const vec3 spherePosition, const float sphereRadius)
+{
+    HitInfo hitInfo;
+    hitInfo.didCollide = false;
+
+    // Imagine sliding along the ray and asking "am I exactly radius units away
+    // from the sphere center?". That becomes a quadratic equation. If the
+    // discriminant is negative, the ray never reaches the sphere.
+    //
+    // Ray equation:
+    // P(t) = O + tD
+    //
+    // Sphere equation:
+    // |P - C|^2 = r^2
+    //
+    // Substituting P(t) gives:
+    // a*t^2 + b*t + c = 0
+    // where:
+    // a = dot(D, D)
+    // b = 2 * dot(O - C, D)
+    // c = dot(O - C, O - C) - r^2
+    //
+    // discriminant = b^2 - 4ac
+    // if discriminant < 0, there is no real hit.
+    vec3 offsetRayOrigin = ray.origin - spherePosition;
+    float a = dot(ray.dir, ray.dir);
+    float b = 2.0 * dot(offsetRayOrigin, ray.dir);
+    float c = dot(offsetRayOrigin, offsetRayOrigin) - sphereRadius * sphereRadius;
+    float discriminant = b * b - 4.0 * a * c;
+    if (discriminant >= 0.0) {
+        float dst = (-b - sqrt(discriminant)) / (2.0 * a);
+        if (dst >= 0.0) {
+            hitInfo.didCollide = true;
+            hitInfo.isBackface = false;
+            hitInfo.dst = dst;
+            hitInfo.hitPoint = ray.origin + ray.dir * dst;
+            hitInfo.normal = normalize(hitInfo.hitPoint - spherePosition);
+            // Spherical UVs allow procedural sphere primitives to reuse the
+            // same PBR texture path as imported triangle meshes.
+            float phi = atan(hitInfo.normal.z, hitInfo.normal.x);
+            hitInfo.uv = vec2(
+                0.5 + phi / (2.0 * PI),
+                0.5 - asin(clamp(hitInfo.normal.y, -1.0, 1.0)) / PI);
+            hitInfo.tangent = normalize(vec3(-sin(phi), 0.0, cos(phi)));
+            hitInfo.bitangent = normalize(cross(hitInfo.normal, hitInfo.tangent));
+        }
+    }
+    return hitInfo;
+}
+
+/**
+ * @brief Finds where a ray hits one triangle and fills surface data.
+ * @details Besides the hit distance, this also estimates the normal and UV at
+ * the exact hit point so lighting and textures look smooth across the triangle.
+ */
+HitInfo RayTriangleIntersection(const Ray ray, const Triangle tri)
+{
+    // This computes the hit as a weighted mix of the three triangle vertices.
+    // The weights are called barycentric coordinates. If any weight is negative,
+    // the ray hit the triangle's plane but outside the actual triangle.
+    //
+    // Hit point interpolation:
+    // P = w*A + u*B + v*C
+    // w = 1 - u - v
+    //
+    // The hit is inside the triangle only when:
+    // t >= 0 and u >= 0 and v >= 0 and w >= 0.
+    vec3 edgeAB = tri.v2 - tri.v1;
+    vec3 edgeAC = tri.v3 - tri.v1;
+    vec3 faceNormal = cross(edgeAB, edgeAC);
+
+    float determinant = -dot(ray.dir, faceNormal);
+    if (abs(determinant) < 1E-6) {
+        HitInfo miss;
+        miss.didCollide = false;
+        return miss;
+    }
+
+    float invdet = 1.0 / determinant;
+    vec3 ao = ray.origin - tri.v1;
+    vec3 dao = cross(ao, ray.dir);
+
+    float t = dot(ao, faceNormal) * invdet;
+    float u = dot(edgeAC, dao) * invdet;
+    float v = -dot(edgeAB, dao) * invdet;
+    float w = 1.0 - u - v;
+
+    if (t < 0.0 || u < 0.0 || v < 0.0 || w < 0.0) {
+        HitInfo miss;
+        miss.didCollide = false;
+        return miss;
+    }
+
+    HitInfo hitInfo;
+    hitInfo.didCollide = true;
+    hitInfo.isBackface = determinant < 0.0;
+    hitInfo.dst = t;
+    hitInfo.hitPoint = ray.origin + ray.dir * t;
+    hitInfo.normal = normalize(tri.NA * w + tri.NB * u + tri.NC * v) * sign(determinant);
+    vec2 uvA = tri.uvA_uvB.xy;
+    vec2 uvB = tri.uvA_uvB.zw;
+    vec2 uvC = tri.uvC_pad.xy;
+    hitInfo.uv = uvA * w + uvB * u + uvC * v;
+
+    // Normal maps store directions relative to the texture, not directly in
+    // world space. tangent/bitangent/normal form a small local coordinate system
+    // that lets ApplyPBRTextures convert texture normals into scene directions.
+    vec2 deltaUV1 = uvB - uvA;
+    vec2 deltaUV2 = uvC - uvA;
+    float uvDeterminant = deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x;
+    if (abs(uvDeterminant) > 1.0e-8) {
+        float inverseUVDeterminant = 1.0 / uvDeterminant;
+        hitInfo.tangent = normalize((edgeAB * deltaUV2.y - edgeAC * deltaUV1.y) * inverseUVDeterminant);
+        hitInfo.bitangent = normalize((edgeAC * deltaUV1.x - edgeAB * deltaUV2.x) * inverseUVDeterminant);
+    }
+    else {
+        vec3 helperAxis = abs(hitInfo.normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        hitInfo.tangent = normalize(cross(helperAxis, hitInfo.normal));
+        hitInfo.bitangent = normalize(cross(hitInfo.normal, hitInfo.tangent));
+    }
+    return hitInfo;
+}
+
+int getMaterialType(RaytracingMaterial material) { return int(round(material.color_type.w)); }
+vec3 getMaterialColor(RaytracingMaterial material) { return material.color_type.rgb; }
+vec3 getEmissionColor(RaytracingMaterial material) { return material.emission_strength.rgb; }
+float getEmissionStrength(RaytracingMaterial material) { return material.emission_strength.w; }
+vec3 getSpecularColor(RaytracingMaterial material) { return material.specular_smoothness.rgb; }
+float getSmoothness(RaytracingMaterial material) { return material.specular_smoothness.w; }
+vec3 getAbsorptionColor(RaytracingMaterial material) { return material.absorption_strength.rgb; }
+float getAbsorptionStrength(RaytracingMaterial material) { return material.absorption_strength.w; }
+float getSpecularProbability(RaytracingMaterial material) { return material.surface_params.x; }
+float getIOR(RaytracingMaterial material) { return material.glass_params.x; }
+float getCheckerScale(RaytracingMaterial material) { return material.pattern_params.x; }
+
+/**
+ * @brief Estimates how much a glass surface reflects instead of refracts.
+ * @details At shallow angles glass behaves more like a mirror. This cheaper
+ * formula approximates that effect without evaluating the full Fresnel equations.
+ */
+float CalculateReflectance(vec3 inDir, vec3 normal, float iorA, float iorB)
+{
+    // This is Schlick's approximation. The important idea is simple: when the ray
+    // looks straight at glass, more light goes through; when it grazes the glass,
+    // more light reflects.
+    //
+    // Formula:
+    // R(theta) = R0 + (1 - R0) * (1 - cos(theta))^5
+    // R0 = ((iorA - iorB) / (iorA + iorB))^2
+    float cosTheta = clamp(dot(-inDir, normal), 0.0, 1.0);
+    float r0 = (iorA - iorB) / (iorA + iorB);
+    r0 *= r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
+}
+
+vec3 SampleDiffuseColor(RaytracingMaterial material, vec3 hitPoint)
+{
+    if (getMaterialType(material) == 1) {
+        // Checker material: alternate between two colors based on the hit
+        // position. This gives a procedural pattern without any texture image.
+        vec3 scaled = floor(hitPoint * getCheckerScale(material));
+        float checker = mod(scaled.x + scaled.y + scaled.z, 2.0);
+        return mix(getMaterialColor(material), getSpecularColor(material), checker);
+    }
+    return getMaterialColor(material);
+}
+
+void BuildTangentBasis(
+    vec3 normalIn,
+    vec3 tangentIn,
+    vec3 bitangentIn,
+    out vec3 normal,
+    out vec3 tangent,
+    out vec3 bitangent)
+{
+    // Clean up the local surface axes used for normal mapping. Imported model
+    // data can contain imperfect tangents, so this makes the three directions
+    // perpendicular enough for stable texture-normal conversion.
+    normal = normalize(normalIn);
+    tangent = tangentIn - normal * dot(normal, tangentIn);
+    if (dot(tangent, tangent) < 1.0e-8) {
+        vec3 helperAxis = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        tangent = cross(helperAxis, normal);
+    }
+    tangent = normalize(tangent);
+    float handedness = dot(cross(normal, tangent), bitangentIn) < 0.0 ? -1.0 : 1.0;
+    bitangent = normalize(cross(normal, tangent)) * handedness;
+}
+
+/**
+ * @brief Fakes small surface depth by shifting texture coordinates.
+ */
+vec2 ApplyParallaxMapping(vec2 tiledUV, vec3 tangentViewDir, int textureLayer, float strength)
+{
+    if (strength <= 0.0) {
+        return tiledUV;
+    }
+
+    // The height map says which parts of the texture should look raised or
+    // recessed. We shift the UV lookup depending on view direction, which creates
+    // the illusion of depth. The actual mesh stays unchanged.
+    //
+    // Simplified offset used here:
+    // centeredHeight = height - 0.5
+    // uvOffset = viewDir.xy * centeredHeight * strength / max(abs(viewDir.z), 0.2)
+    // newUV = oldUV - uvOffset
+    float height = texture(u_heightTextures, vec3(tiledUV, float(textureLayer))).r;
+    float centeredHeight = height - 0.5;
+    float grazingLimiter = max(abs(tangentViewDir.z), 0.2);
+    return tiledUV - tangentViewDir.xy * centeredHeight * strength / grazingLimiter;
+}
+
+/**
+ * @brief Applies PBR texture details to the surface that was hit.
+ */
+void ApplyPBRTextures(inout HitInfo hit, vec3 viewDirection)
+{
+    if (hit.usePBRTextures == 0 || !IsValidPBRLayer(hit.textureLayer)) {
+        return;
+    }
+
+    // First prepare the local texture coordinate system at this hit point.
+    // Then use the height map to shift UVs and the normal map to bend the normal.
+    vec3 normal;
+    vec3 tangent;
+    vec3 bitangent;
+    BuildTangentBasis(hit.normal, hit.tangent, hit.bitangent, normal, tangent, bitangent);
+    mat3 tangentToWorld = mat3(tangent, bitangent, normal);
+
+    vec2 tiledUV = hit.uv * hit.pbrParameters.x;
+    vec3 tangentViewDir = normalize(transpose(tangentToWorld) * normalize(viewDirection));
+    tiledUV = ApplyParallaxMapping(tiledUV, tangentViewDir, hit.textureLayer, hit.pbrExtraParameters.x);
+    hit.uv = tiledUV / hit.pbrParameters.x;
+
+    vec3 tangentNormal = texture(u_normalTextures, vec3(tiledUV, float(hit.textureLayer))).xyz * 2.0 - 1.0;
+    tangentNormal.xy *= hit.pbrParameters.y;
+    tangentNormal = normalize(tangentNormal);
+    hit.normal = normalize(tangentToWorld * tangentNormal);
+}
+
+/**
+ * @brief Searches a model's BVH to find the nearest triangle hit.
+ */
+void BVH_traverse(Ray ray, int nodeOffset, int triangleOffset, inout HitInfo closestHit, inout uint AABB_intersect_count, inout uint TRI_intersect_count)
+{
+    // Some scenes have no mesh models, only spheres. Renderer still creates a
+    // placeholder model buffer for OpenGL safety. Negative offsets mark that
+    // placeholder, so the shader knows there is nothing to traverse.
+    if (BVH.length() == 0 || nodeOffset < 0 || nodeOffset >= BVH.length() || triangleOffset < 0) {
+        return;
+    }
+
+    int stack_elements[MAX_STACK_SIZE];
+    int stack_top = 0;
+    stack_elements[stack_top++] = nodeOffset;
+
+    // GLSL shaders do not handle recursive tree walking well, so this uses a
+    // manual stack. Boxes decide which child boxes to visit; leaf boxes contain
+    // the real triangles that finally need intersection tests.
+    while (stack_top > 0)
+    {
+        int current_node_idx = stack_elements[--stack_top];
+        // Safety check: if bad model/BVH data ever points outside the buffer,
+        // skip that index instead of letting the GPU read invalid memory.
+        if (current_node_idx < 0 || current_node_idx >= BVH.length()) {
+            continue;
+        }
+        BVHNode current_node = BVH[current_node_idx];
+
+        float aabbDst;
+        if (!RayAABBIntersection(ray, current_node.minVec, current_node.maxVec, aabbDst) || aabbDst > closestHit.dst) {
+            continue;
+        }
+
+        if (current_node.triangleCount > 0) {
+            // Leaf node: this box is small enough that we now test its actual
+            // triangles one by one.
+            for (int i = 0; i < current_node.triangleCount; i++) {
+                Triangle tri = MESH[triangleOffset + current_node.startIndex + i];
+                HitInfo triHitInfo = RayTriangleIntersection(ray, tri);
+                TRI_intersect_count += 1u;
+                if (triHitInfo.didCollide) {
+                    if (triHitInfo.dst < closestHit.dst) {
+                        closestHit = triHitInfo;
+                    }
+                }
+            }
+        }
+        else {
+            // Internal node: test the two child boxes. The nearer child is pushed
+            // last so it is processed first when popped from the stack.
+            int childA = nodeOffset + current_node.startIndex;
+            int childB = nodeOffset + current_node.startIndex + 1;
+
+            float dstA;
+            float dstB;
+            bool hitA = childA >= 0 && childA < BVH.length() && RayAABBIntersection(ray, BVH[childA].minVec, BVH[childA].maxVec, dstA);
+            bool hitB = childB >= 0 && childB < BVH.length() && RayAABBIntersection(ray, BVH[childB].minVec, BVH[childB].maxVec, dstB);
+            AABB_intersect_count += 2u;
+
+            if (hitA && hitB) {
+                if (dstA > dstB) {
+                    if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childA;
+                    if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childB;
+                }
+                else {
+                    if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childB;
+                    if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childA;
+                }
+            }
+            else if (hitA) {
+                if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childA;
+            }
+            else if (hitB) {
+                if (stack_top < MAX_STACK_SIZE) stack_elements[stack_top++] = childB;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Finds the first object hit by a ray.
+ */
+HitInfo CheckRayCollision(Ray ray, inout HitInfo closestHit, inout uint AABB_intersect_count, inout uint TRI_intersect_count)
+{
+    closestHit.didCollide = false;
+    closestHit.dst = INF;
+
+    for (int i = 0; i < NUM_SPHERES; i++)
+    {
+        // Spheres are cheap to test, so they are checked directly before the
+        // mesh BVHs. radius <= 0 means that array slot is unused.
+        Sphere sphere = u_Spheres[i];
+        if (sphere.radius <= 0.0) {
+            continue;
+        }
+
+        HitInfo hitInfo = RaySphereIntersection(ray, sphere.position, sphere.radius);
+        if (hitInfo.didCollide && hitInfo.dst < closestHit.dst) {
+            closestHit = hitInfo;
+            closestHit.textureLayer = sphere.pbrTextureInfo.x;
+            closestHit.usePBRTextures = sphere.pbrTextureInfo.y;
+            closestHit.pbrParameters = sphere.pbrParameters;
+            closestHit.pbrExtraParameters = sphere.pbrExtraParameters;
+            closestHit.material = sphere.material;
+        }
+    }
+
+    for (int modelIndex = 0; modelIndex < MODELS.length(); ++modelIndex) {
+        ModelInfo model = MODELS[modelIndex];
+        // Skip placeholder/dummy model entries. They exist only so the OpenGL
+        // buffer is never empty.
+        if (model.nodeOffset < 0 || model.nodeOffset >= BVH.length() || model.triangleOffset < 0) {
+            continue;
+        }
+
+        // Each mesh BVH was built before the model was placed in the world. So
+        // the BVH is in the model's local space. It is cheaper to move the ray
+        // into that local space than to move all triangles into world space.
+        Ray localRay;
+        localRay.origin = (model.worldToLocalMatrix * vec4(ray.origin, 1.0)).xyz;
+        localRay.dir = (model.worldToLocalMatrix * vec4(ray.dir, 0.0)).xyz;
+        localRay.invDir = 1.0 / localRay.dir;
+
+        HitInfo modelHit;
+        modelHit.didCollide = false;
+        modelHit.dst = INF;
+
+        BVH_traverse(localRay, model.nodeOffset, model.triangleOffset, modelHit, AABB_intersect_count, TRI_intersect_count);
+        if (modelHit.didCollide) {
+            vec3 worldHitPoint = (model.localToWorldMatrix * vec4(modelHit.hitPoint, 1.0)).xyz;
+            float worldDst = length(worldHitPoint - ray.origin);
+            if (worldDst < closestHit.dst) {
+                closestHit = modelHit;
+                closestHit.dst = worldDst;
+                closestHit.hitPoint = worldHitPoint;
+                closestHit.normal = normalize((transpose(model.worldToLocalMatrix) * vec4(modelHit.normal, 0.0)).xyz);
+                closestHit.tangent = normalize((model.localToWorldMatrix * vec4(modelHit.tangent, 0.0)).xyz);
+                closestHit.bitangent = normalize((model.localToWorldMatrix * vec4(modelHit.bitangent, 0.0)).xyz);
+                closestHit.textureLayer = model.textureLayer;
+                closestHit.usePBRTextures = model.usePBRTextures;
+                closestHit.pbrParameters = model.pbrParameters;
+                closestHit.pbrExtraParameters = model.pbrExtraParameters;
+                closestHit.material = model.material;
+            }
+        }
+    }
+
+    if (closestHit.didCollide) {
+        // Texture effects are applied only after the closest object is known.
+        // This avoids doing normal/parallax texture work for hits that are later
+        // hidden by a nearer object.
+        ApplyPBRTextures(closestHit, -ray.dir);
+    }
+
+    return closestHit;
+}
+
+/**
+ * @brief Follows one ray path through the scene and returns its light contribution.
+ */
+vec3 TraceRay(Ray ray, inout uint state, inout uint AABB_intersect_count, inout uint TRI_intersect_count)
+{
+    // throughput is the ray's remaining "energy". A white diffuse surface keeps
+    // a lot of energy, a dark surface removes most of it, and glass/metal redirect
+    // it. Every bounce updates this value.
+    vec3 throughput = vec3(1.0);
+    // brightness_score accumulates the light found along this path. main() will
+    // average it with other rays for the same pixel and with previous frames.
+    vec3 brightness_score = vec3(0.0);
+
+    for (int bounce = 0; bounce <= int(RAY_BOUNCE_COUNT); bounce++)
+    {
+        HitInfo hit;
+        CheckRayCollision(ray, hit, AABB_intersect_count, TRI_intersect_count);
+
+        if (!hit.didCollide) {
+            // If the ray escapes the scene, it sees the sky. This is background
+            // light, so it contributes color and then the path ends.
+            brightness_score += GainSkyboxLight(ray) * throughput;
+            break;
+        }
+
+        RaytracingMaterial material = hit.material;
+        // If the hit object emits light, add that light. In the scene presets,
+        // glowing/emissive spheres are used as area light sources.
+        brightness_score += getEmissionColor(material) * getEmissionStrength(material) * throughput;
+
+        vec3 diffuseColor = SampleDiffuseColor(material, hit.hitPoint);
+        vec3 diffuseDir = normalize(hit.normal + RandomDirection(state));
+        float smoothness = getSmoothness(material);
+        float specularProbability = getSpecularProbability(material);
+        vec3 specularColor = getSpecularColor(material);
+
+        if (hit.usePBRTextures != 0 && IsValidPBRLayer(hit.textureLayer)) {
+            vec3 textureCoordinates = vec3(hit.uv * hit.pbrParameters.x, float(hit.textureLayer));
+            vec3 albedo = texture(u_albedoTextures, textureCoordinates).rgb * getMaterialColor(material);
+            float roughnessMap = texture(u_roughnessTextures, textureCoordinates).r;
+            float metallicMap = texture(u_metallicTextures, textureCoordinates).r;
+            // PBR textures refine the simple material:
+            // - albedo changes the surface color;
+            // - roughness controls how sharp or blurry reflections are;
+            // - metallic makes the reflection color come from the material itself.
+            // This is a simplified PBR model: it gives useful visual control
+            // without implementing every detail of physically based shading.
+            float roughness = clamp(roughnessMap * hit.pbrParameters.z + hit.pbrExtraParameters.y, 0.02, 1.0);
+            float metallic = clamp(max(metallicMap * hit.pbrParameters.w, hit.pbrExtraParameters.z), 0.0, 1.0);
+            float ambientOcclusion = texture(u_aoTextures, textureCoordinates).r;
+
+            diffuseColor = albedo * mix(1.0, ambientOcclusion, 0.65) * (1.0 - metallic);
+            smoothness = 1.0 - roughness;
+            specularColor = mix(vec3(0.04), albedo, metallic);
+            specularProbability = mix(0.08 + 0.22 * smoothness, 1.0, metallic);
+        }
+
+        if (getMaterialType(material) == 2)
+        {
+            // Glass has two possible next directions: reflect off the surface or
+            // bend through it. The reflectance value decides the probability.
+            // When the ray travels inside glass, absorption darkens it based on
+            // how far it travelled through the material.
+            //
+            // Refraction ratio:
+            // eta = iorCurrent / iorNext
+            //
+            // Absorption used when exiting glass:
+            // throughput *= exp(-distance * absorptionColor * absorptionStrength)
+            if (hit.isBackface) {
+                throughput *= exp(-hit.dst * getAbsorptionColor(material) * getAbsorptionStrength(material));
+            }
+
+            float iorCurrent = hit.isBackface ? getIOR(material) : 1.0;
+            float iorNext = hit.isBackface ? 1.0 : getIOR(material);
+            float reflectance = CalculateReflectance(ray.dir, hit.normal, iorCurrent, iorNext);
+            vec3 reflectDir = normalize(mix(diffuseDir, reflect(ray.dir, hit.normal), max(specularProbability, smoothness)));
+            vec3 refractDir = refract(ray.dir, hit.normal, iorCurrent / iorNext);
+            bool canRefract = length(refractDir) > 0.0;
+            if (canRefract) {
+                refractDir = normalize(mix(-diffuseDir, refractDir, smoothness));
+            }
+
+            bool followReflection = !canRefract || RandomValue(state) <= reflectance;
+            ray.dir = followReflection ? reflectDir : refractDir;
+            // Start the next ray slightly away from the surface. Otherwise tiny
+            // floating-point errors can make it hit the same surface again.
+            ray.origin = hit.hitPoint + ray.dir * 0.01;
+            ray.invDir = 1.0 / ray.dir;
+            throughput *= diffuseColor;
+        }
+        else
+        {
+            bool isSpecularBounce = specularProbability >= RandomValue(state);
+            vec3 specularDir = reflect(ray.dir, hit.normal);
+            ray.dir = normalize(mix(diffuseDir, specularDir, smoothness * float(isSpecularBounce)));
+            // Opaque surfaces need a smaller offset than glass. This prevents
+            // self-hits while keeping nearby shadows/contact points tight.
+            ray.origin = hit.hitPoint + ray.dir * 0.001;
+            ray.invDir = 1.0 / ray.dir;
+            throughput *= mix(diffuseColor, specularColor, float(isSpecularBounce));
+        }
+
+        // After a few bounces, very dark paths usually add little to the image.
+        // Randomly stop some of them to save work. The paths that continue are
+        // brightened to compensate, so the average remains correct.
+        //
+        // continueProbability = clamp(max(throughput.r,g,b), 0.05, 0.95)
+        // if the path survives:
+        // throughput /= continueProbability
+        if (bounce >= 2) {
+            float continueProbability = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            if (RandomValue(state) > continueProbability) {
+                break;
+            }
+            throughput /= continueProbability;
+        }
+
+    }
+
+    return brightness_score;
+}
+
+void main()
+{
+    // One GPU thread shades one pixel. application.cpp chooses the dispatch size
+    // from the ImGui viewport dimensions.
+    ivec2 texelCoords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(rayTracingTexture);
+    if (texelCoords.x >= dims.x || texelCoords.y >= dims.y) {
+        return;
+    }
+
+    // Convert pixel coordinates to a simple screen plane centered at (0, 0).
+    // u_ModelMatrix rotates the camera ray from camera space into world space.
+    float x = float(texelCoords.x * 2 - dims.x) / float(dims.x);
+    float y = float(texelCoords.y * 2 - dims.y) / float(dims.x);
+
+    uint state = getCurrentState(texelCoords, dims.x);
+
+    Ray ray;
+    ray.dir = normalize(vec3(x, y, u_FocalLength));
+    ray.dir = normalize((u_ModelMatrix * vec4(ray.dir, 1.0)).rgb);
+    ray.origin = u_CameraPos;
+    ray.invDir = 1.0 / ray.dir;
+
+    uint AABB_intersect_count = 0u;
+    uint TRI_intersect_count = 0u;
+
+    // Trace one or more noisy paths for this pixel. More rays per pixel reduce
+    // noise per frame but cost more GPU work.
+    vec3 tracingResult = vec3(0.0);
+    for (int i = 0; i < int(RAYS_PER_PIXEL_COUNT); i++) {
+        tracingResult += TraceRay(ray, state, AABB_intersect_count, TRI_intersect_count);
+    }
+
+    if (u_displayBVH) {
+        tracingResult = complexityToRGB(AABB_intersect_count, u_bvh_heatmap_color_limit);
+    }
+    else if (u_displayTriangleHeatmap) {
+        tracingResult = complexityToRGB(TRI_intersect_count, u_triangle_heatmap_color_limit);
+    }
+    else {
+        tracingResult /= max(float(RAYS_PER_PIXEL_COUNT), 1.0);
+    }
+
+    // Progressive accumulation: keep a running average in the same HDR texture.
+    // application.cpp resets u_numAccumulatedFrames when camera/GUI input changes.
+    //
+    // Running average:
+    // weight = 1 / (numAccumulatedFrames + 1)
+    // output = previous * (1 - weight) + currentSample * weight
+    vec4 accumulatedColor = imageLoad(rayTracingTexture, texelCoords);
+    float weight = 1.0 / float(u_numAccumulatedFrames + 1u);
+    vec3 outputColor = accumulatedColor.rgb * (1.0 - weight) + tracingResult * weight;
+    imageStore(rayTracingTexture, texelCoords, vec4(outputColor, 1.0));
+
+    barrier();
+
+    // Only the pixel under the mouse writes debug data. Renderer reads this SSBO
+    // back and application.cpp shows the values in the viewport tooltip.
+    if (gl_GlobalInvocationID.xy == u_pixelGlobalInvocationID.xy) {
+        pixelData.pixelColor = vec4(outputColor, TRI_intersect_count);
+        pixelData.AABB_intersect_count = AABB_intersect_count;
+    }
+}

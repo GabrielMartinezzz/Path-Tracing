@@ -1,0 +1,227 @@
+#version 460 core
+
+/**
+ * @file ComputePostProcessing.comp
+ * @brief Post-processing compute shader.
+ * @details
+ * References used for the image operations:
+ * - ACES fitted tone curve by Krzysztof Narkowicz:
+ *   https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
+ * - Rec. 709 luminance coefficients:
+ *   https://en.wikipedia.org/wiki/Rec._709
+ * - Edge-Avoiding A-Trous wavelet filtering for Monte Carlo GI:
+ *   https://jo.dreggn.org/home/2010_atrous.pdf
+ * - SVGF, real-time reconstruction for path-traced global illumination:
+ *   https://research.nvidia.com/publication/2017-07_spatiotemporal-variance-guided-filtering-real-time-reconstruction-path-traced
+ * - Bilateral filtering, the base edge-preserving filter idea:
+ *   https://users.cs.duke.edu/~tomasi/papers/tomasi/tomasiIccv98.pdf
+ *
+ * Overview: ComputeRayTracing.comp produces a raw HDR image. HDR means the
+ * color values can be brighter than what the monitor can directly display. This
+ * shader turns that raw image into the final viewport image by optionally
+ * reducing noise, adding glow, adjusting exposure, compressing highlights and
+ * applying gamma.
+ *
+ * Pipeline:
+ * 1. Read rtxTexture, the HDR image written by the ray tracing pass.
+ * 2. Optionally denoise and add bloom while values are still HDR.
+ * 3. Apply exposure, tone mapping and gamma.
+ * 4. Write postprocTexture, which application.cpp draws in the ImGui viewport.
+ */
+
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;
+// Input HDR texture from the ray tracing pass. This is the "raw" accumulated
+// light before display conversion.
+layout(rgba32f, binding = 0) uniform image2D rtxTexture;
+// Output display texture used by the ImGui viewport after post-processing.
+layout(rgba32f, binding = 1) uniform image2D postprocTexture;
+
+// Small settings edited in CameraRenderSettingsGUI.h and uploaded by Renderer before
+// this shader is dispatched.
+layout(std140, binding = 2) uniform uniforms {
+    uint u_numAccumulatedFrames;
+    bool u_enabled;
+    bool u_useACES;
+    float u_exposure;
+    float u_gamma;
+    bool u_bloomEnabled;
+    float u_bloomThreshold;
+    float u_bloomIntensity;
+    bool u_denoiseEnabled;
+    float u_denoiseStrength;
+};
+
+/**
+ * @brief Compresses HDR color into a displayable range using an ACES-like curve.
+ * @details Bright values are pushed down smoothly instead of being clipped to
+ * white. This keeps bright lights visible while preserving contrast.
+ *
+ * Formula by Krzysztof Narkowicz:
+ * color = (color * (a * color + b)) / (color * (c * color + d) + e)
+ * then clamp to [0, 1].
+ */
+vec3 ACESFilm(vec3 color)
+{
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+/**
+ * @brief Estimates perceived brightness from RGB.
+ * @details Human vision is more sensitive to green than red, and more sensitive
+ * to red than blue. Rec. 709 weights approximate that.
+ *
+ * Formula:
+ * luminance = dot(color, vec3(0.2126, 0.7152, 0.0722))
+ */
+float luminance(vec3 color)
+{
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 loadClamped(ivec2 coordinates, ivec2 dimensions)
+{
+    // Neighbor filters sample around the current pixel. Clamping keeps samples at
+    // image borders valid instead of reading outside the texture.
+    return imageLoad(rtxTexture, clamp(coordinates, ivec2(0), dimensions - 1)).rgb;
+}
+
+/**
+ * @brief Applies a small bilateral denoise filter around one pixel.
+ * @details This is a simplified ray-tracing denoiser. It follows the same
+ * edge-preserving idea used by Monte Carlo denoisers such as A-Trous/SVGF, but
+ * only uses color similarity. A full production denoiser would also use normal,
+ * depth, motion and variance buffers to avoid blurring object boundaries.
+ *
+ * Nearby pixels help reduce Monte Carlo noise, but pixels with very different
+ * colors contribute less, so edges are preserved better than with a normal blur.
+ *
+ * Weight per neighbor:
+ * spatialWeight = exp(-0.5 * (x^2 + y^2))
+ * colorWeight = exp(-colorDifference^2 * colorSensitivity)
+ * finalWeight = spatialWeight * colorWeight
+ *
+ * Final color:
+ * filtered = sum(sampleColor * finalWeight) / sum(finalWeight)
+ */
+vec3 denoiseBilateral(ivec2 coordinates, ivec2 dimensions)
+{
+    vec3 center = loadClamped(coordinates, dimensions);
+    vec3 filtered = vec3(0.0);
+    float totalWeight = 0.0;
+
+    // As more frames accumulate, the image naturally becomes less noisy, so the
+    // filter can become less aggressive.
+    //
+    // temporalReduction = 1 / sqrt(numAccumulatedFrames + 1)
+    float temporalReduction = inversesqrt(float(u_numAccumulatedFrames) + 1.0);
+    float colorSensitivity = 6.0 / max(u_denoiseStrength * temporalReduction, 0.05);
+
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            vec3 sampleColor = loadClamped(coordinates + ivec2(x, y), dimensions);
+            float spatialWeight = exp(-0.5 * float(x * x + y * y));
+            float colorDifference = length(sampleColor - center);
+            float colorWeight = exp(-colorDifference * colorDifference * colorSensitivity);
+            float weight = spatialWeight * colorWeight;
+
+            filtered += sampleColor * weight;
+            totalWeight += weight;
+        }
+    }
+
+    return filtered / max(totalWeight, 1.0e-6);
+}
+
+vec3 extractBloom(vec3 color)
+{
+    // Bloom starts by keeping only the part of a color that is brighter than the
+    // threshold. Darker pixels contribute nothing to the glow.
+    //
+    // contribution = max(brightness - threshold, 0) / brightness
+    float brightness = luminance(color);
+    float contribution = max(brightness - u_bloomThreshold, 0.0) / max(brightness, 1.0e-6);
+    return color * contribution;
+}
+
+/**
+ * @brief Computes a compact 5x5 glow around bright pixels.
+ * @details Bloom samples neighboring HDR pixels, extracts their bright part, and
+ * mixes them with Gaussian-like weights. Emissive objects therefore glow before
+ * tone mapping compresses their highlights.
+ *
+ * Weight per neighbor:
+ * weight = weights[abs(x)] * weights[abs(y)]
+ *
+ * Final bloom:
+ * bloom = sum(extractedBrightColor * weight) / sum(weight)
+ */
+vec3 calculateBloom(ivec2 coordinates, ivec2 dimensions)
+{
+    const float weights[3] = float[](0.4026, 0.2442, 0.0545);
+    vec3 bloom = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            float weight = weights[abs(x)] * weights[abs(y)];
+            bloom += extractBloom(loadClamped(coordinates + ivec2(x, y), dimensions)) * weight;
+            totalWeight += weight;
+        }
+    }
+
+    return bloom / max(totalWeight, 1.0e-6);
+}
+
+void main()
+{
+    // One GPU thread post-processes one viewport pixel. This pass never changes
+    // scene geometry; it only reprocesses the image produced by ray tracing.
+    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dimensions = imageSize(rtxTexture);
+    if (pixel_coords.x >= dimensions.x || pixel_coords.y >= dimensions.y) {
+        return;
+    }
+
+    vec3 color = imageLoad(rtxTexture, pixel_coords).rgb;
+
+    if (u_enabled) {
+        // Order matters:
+        // 1. denoise first, while the image still contains raw ray tracing noise;
+        // 2. add bloom while bright values are still HDR;
+        // 3. exposure shifts brightness;
+        // 4. tone mapping compresses HDR to display range;
+        // 5. gamma converts linear color for display.
+        if (u_denoiseEnabled) {
+            color = denoiseBilateral(pixel_coords, dimensions);
+        }
+
+        if (u_bloomEnabled) {
+            color += calculateBloom(pixel_coords, dimensions) * u_bloomIntensity;
+        }
+
+        // Exposure is expressed in photographic stops (EV).
+        //
+        // Formula:
+        // color *= 2 ^ exposure
+        // exposure = 1 doubles brightness, exposure = -1 halves it.
+        color *= exp2(u_exposure);
+
+        if (u_useACES) {
+            color = ACESFilm(color);
+        }
+
+        // Convert the linear renderer output to display gamma.
+        //
+        // Formula:
+        // displayColor = linearColor ^ (1 / gamma)
+        color = pow(max(color, vec3(0.0)), vec3(1.0 / max(u_gamma, 0.1)));
+    }
+
+    // Store alpha as 1 because the viewport image is fully opaque.
+    imageStore(postprocTexture, pixel_coords, vec4(color, 1.0));
+}
